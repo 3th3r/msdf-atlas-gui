@@ -1,0 +1,15 @@
+# Dépôt Git
+.git/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Éditeur / outils
+.vscode/
+.claude/
+
+# Sorties de test
+output/

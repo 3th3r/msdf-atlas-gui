@@ -1,3 +1,18 @@
+# --- msdf-atlas-gui ---
+# Éditeur / outils
+.vscode/
+.claude/settings.local.json
+
+# Perforce (config de workspace locale, si vous en utilisez une)
+.p4config
+p4config.txt
+
+# Config utilisateur de l'outil (chemin de l'exe, derniers réglages)
+settings.json
+
+# Sorties de test
+output/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
