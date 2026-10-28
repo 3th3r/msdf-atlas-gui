@@ -4,12 +4,15 @@ Builds the command line(s) from the fields, displays them, then runs them.
 Standard library only (Tkinter / ttk).
 """
 
+import csv
 import json
+import math
 import os
 import queue
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,6 +20,8 @@ from tkinter import filedialog, messagebox, ttk
 # Base of every relative path: the folder containing this script.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+# Temporary JSON metrics, used for the Unreal Engine CSV when the JSON output is not ticked.
+TEMP_DIR = tempfile.gettempdir()
 
 TYPES = ["hardmask", "softmask", "sdf", "psdf", "msdf", "mtsdf"]
 PRESETS = ["256", "512", "1024", "2048", "4096"]
@@ -70,7 +75,10 @@ CODEPOINTS = {name: frozenset(cp for i in items for cp in _item_codepoints(i)) f
 # Whitespace / invisible codepoints, used to detect empty glyphs in CFF fonts (approximation).
 WHITESPACE = frozenset([0x20, 0xA0, *range(0x2000, 0x2010), 0x2028, 0x2029, 0x202F, 0x205F, *range(0x2060, 0x2065)])
 
-PATH_KEYS = ("exe", "font", "image_dir", "image_path", "csv_path", "json_path")
+PATH_KEYS = ("exe", "font", "image_dir", "image_path", "csv_path", "json_path", "ue_csv_path")
+
+UE_COLUMNS = ["Name", "Codepoint", "Atlas", "Char", "Advance", "PenU", "PenV", "UMin", "UMax", "VMin", "VMax",
+              "Column", "Row"]
 
 DEFAULTS = {
     "exe": "",
@@ -94,6 +102,9 @@ DEFAULTS = {
     "json": False,
     "json_auto": True,
     "json_path": "",
+    "ue_csv": False,
+    "ue_csv_auto": True,
+    "ue_csv_path": "",
     "charset_order": DEFAULT_ORDER,
     "charset_atlas": {},
     "atlas_mode": "auto",
@@ -195,7 +206,10 @@ def _parse_cmap(data, offset):
 
 
 def read_font_glyphs(path):
-    """Returns (codepoints with a non-empty glyph, exact) or None if the font cannot be read."""
+    """Returns (codepoints with a non-empty glyph, bboxes) or None if the font cannot be read.
+
+    bboxes: codepoint -> (xMin, yMin, xMax, yMax) in em, read from the glyf table; None for a CFF font.
+    """
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -207,17 +221,85 @@ def read_font_glyphs(path):
             tables[tag] = offset
         cmap = _parse_cmap(data, tables[b"cmap"])
         if b"glyf" in tables and b"loca" in tables:
+            units_per_em = struct.unpack_from(">H", data, tables[b"head"] + 18)[0]
             long_loca = struct.unpack_from(">h", data, tables[b"head"] + 50)[0]
             num_glyphs = struct.unpack_from(">H", data, tables[b"maxp"] + 4)[0]
             if long_loca:
                 loca = struct.unpack_from(f">{num_glyphs + 1}I", data, tables[b"loca"])
             else:
                 loca = [x * 2 for x in struct.unpack_from(f">{num_glyphs + 1}H", data, tables[b"loca"])]
-            # Empty glyph = loca entry of length 0.
-            return frozenset(c for c, g in cmap.items() if g < num_glyphs and loca[g + 1] > loca[g]), True
-        return frozenset(c for c in cmap if c not in WHITESPACE), False
-    except (OSError, struct.error, KeyError, IndexError):
+            glyf = tables[b"glyf"]
+            # Empty glyph = loca entry of length 0. Otherwise the glyph header holds its bbox.
+            bboxes = {c: tuple(v / units_per_em for v in struct.unpack_from(">4h", data, glyf + loca[g] + 2))
+                      for c, g in cmap.items() if g < num_glyphs and loca[g + 1] > loca[g]}
+            return frozenset(bboxes), bboxes
+        return frozenset(c for c in cmap if c not in WHITESPACE), None
+    except (OSError, struct.error, KeyError, IndexError, ZeroDivisionError):
         return None
+
+
+# ------------------------------------------------------ Unreal Engine CSV
+
+def _num(value):
+    return f"{round(value, 6) + 0.0:.6f}"
+
+
+def _cp_list(cps):
+    return ", ".join(f"U+{c:04X}" for c in cps[:10]) + (" …" if len(cps) > 10 else "")
+
+
+def write_ue_csv(path, metrics, bboxes):
+    """Merges the JSON metrics of each atlas into one Unreal Engine DataTable CSV. Returns (rows, warnings).
+
+    Units: UV space of the glyph's cell, 0-1, U to the right, V downwards. A codepoint is kept in its first atlas.
+    Glyphs without a cell (whitespace, empty glyphs) are not written.
+    """
+    rows, duplicates, clamped = {}, [], []
+    for atlas_index, json_path in enumerate(metrics, 1):
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        atlas = data["atlas"]
+        if atlas.get("yOrigin", "bottom") != "bottom":
+            raise ValueError(f"unexpected yOrigin in {json_path}")
+        size, height = atlas["size"], atlas["height"]
+        cell_w, cell_h = atlas["grid"]["cellWidth"], atlas["grid"]["cellHeight"]
+        for glyph in data["glyphs"]:
+            cp = glyph["unicode"]
+            plane, box = glyph.get("planeBounds"), glyph.get("atlasBounds")
+            if plane is None or box is None:
+                continue
+            if cp in rows:
+                duplicates.append(cp)
+                continue
+            advance = glyph["advance"] * size / cell_w
+            pen_u = (0.5 - plane["left"] * size) / cell_w
+            pen_v = 1 - (0.5 - plane["bottom"] * size) / cell_h
+            x_min, y_min, x_max, y_max = bboxes.get(cp, (0, 0, 0, 0))
+            bounds = [pen_u + x_min * size / cell_w, pen_u + x_max * size / cell_w,
+                      pen_v - y_max * size / cell_h, pen_v - y_min * size / cell_h]
+            if any(not 0 <= b <= 1 for b in bounds):
+                clamped.append(cp)
+                bounds = [min(max(b, 0.0), 1.0) for b in bounds]
+            # atlasBounds are shifted by half a pixel (top can exceed the height): use the centre of the cell.
+            column = math.floor((box["left"] + box["right"]) / 2 / cell_w)
+            row = math.floor((height - (box["bottom"] + box["top"]) / 2) / cell_h)
+            rows[cp] = [atlas_index, advance, pen_u, pen_v, *bounds, column, row]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(UE_COLUMNS)
+        for cp in sorted(rows):
+            atlas_index, *values, column, row = rows[cp]
+            writer.writerow([cp, cp, atlas_index, chr(cp), *(_num(v) for v in values), column, row])
+
+    warnings = []
+    if duplicates:
+        warnings.append(f"{len(duplicates)} codepoint(s) present in several atlases, "
+                        f"kept in the first one: {_cp_list(duplicates)}")
+    if clamped:
+        warnings.append(f"{len(clamped)} glyph(s) extend beyond their cell, bbox clamped to 0-1: "
+                        f"{_cp_list(clamped)}")
+    return len(rows), warnings
 
 
 class App:
@@ -229,7 +311,7 @@ class App:
         self.log_queue = queue.Queue()
         self.font_key = None
         self.font_glyphs = None
-        self.font_exact = False
+        self.font_bboxes = None
         self.glyph_cache = {}
         self.pages = []
         self.layout_errors = []
@@ -265,6 +347,9 @@ class App:
         self.json = tk.BooleanVar(value=s["json"])
         self.json_auto = tk.BooleanVar(value=s["json_auto"])
         self.json_path = tk.StringVar(value=s["json_path"])
+        self.ue_csv = tk.BooleanVar(value=s["ue_csv"])
+        self.ue_csv_auto = tk.BooleanVar(value=s["ue_csv_auto"])
+        self.ue_csv_path = tk.StringVar(value=s["ue_csv_path"])
         self.prev_auto = {"image": self.image_auto.get(), "csv": self.csv_auto.get(), "json": self.json_auto.get()}
 
         self.build_ui()
@@ -272,6 +357,7 @@ class App:
         for var in (self.exe, self.font, self.type, self.size, self.uniform, self.cell_x, self.cell_y,
                     self.pxrange, self.dim_x, self.dim_y, self.square, self.image_auto, self.image_path,
                     self.csv, self.csv_auto, self.csv_path, self.json, self.json_auto, self.json_path,
+                    self.ue_csv, self.ue_csv_auto, self.ue_csv_path,
                     *self.charset_vars.values()):
             var.trace_add("write", lambda *_: self.refresh())
         self.refresh()
@@ -370,6 +456,9 @@ class App:
                                                      lambda: self.browse_side(self.csv_path, ".csv"))
         self.json_entry, row = self.build_side_output(main, row, "JSON", self.json, self.json_auto, self.json_path,
                                                       lambda: self.browse_side(self.json_path, ".json"))
+        self.ue_entry, row = self.build_side_output(main, row, "CSV UE", self.ue_csv, self.ue_csv_auto,
+                                                    self.ue_csv_path,
+                                                    lambda: self.browse_side(self.ue_csv_path, ".csv"))
 
         ttk.Separator(main).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         row += 1
@@ -420,6 +509,7 @@ class App:
         auto_cb = ttk.Checkbutton(f, text="Auto name", variable=auto)
         auto_cb.pack(side="left", padx=(6, 0))
         entry.side_widgets = (btn, auto_cb)
+        entry.check = cb
         return entry, row + 1
 
     def rebuild_charset_grid(self):
@@ -490,7 +580,7 @@ class App:
         self.font_key = key
         self.glyph_cache = {}
         result = read_font_glyphs(key) if key and os.path.isfile(key) else None
-        self.font_glyphs, self.font_exact = result if result else (None, False)
+        self.font_glyphs, self.font_bboxes = result if result else (None, None)
 
     def charset_glyphs(self, name):
         """Glyphs that take a cell: codepoints present in the font, minus empty glyphs."""
@@ -517,6 +607,17 @@ class App:
         except ValueError:
             return None
         return (dx // cx) * (dy // cy)
+
+    def ue_csv_problem(self):
+        """Why the Unreal Engine CSV cannot be written, or None."""
+        if not self.uniform.get():
+            return "CSV UE requires uniform cells."
+        if self.font_bboxes is None:
+            return "CSV UE requires a TrueType font (glyf table)."
+        return None
+
+    def ue_csv_active(self):
+        return self.ue_csv.get() and self.ue_csv_problem() is None
 
     def auto_pages(self, names):
         """Fills atlas 1 in order, then atlas 2, etc. A charset is never split."""
@@ -587,8 +688,8 @@ class App:
         finally:
             self._refreshing = False
 
-    def auto_base_name(self, names, single):
-        font_name = os.path.splitext(os.path.basename(self.font.get().strip()))[0] or "atlas"
+    def auto_base_name(self, names, single, suffix=""):
+        font_name = (os.path.splitext(os.path.basename(self.font.get().strip()))[0] or "atlas") + suffix
         if single and len(names) == len(DEFAULT_ORDER):
             return font_name + "_all"
         return font_name + "_" + "-".join(ABBRS[n] for n in names) if names else font_name
@@ -618,7 +719,8 @@ class App:
             stem = os.path.splitext(image)[0]
             csv = stem + ".csv" if self.csv_auto.get() else numbered(self.csv_path.get().strip(), index, count)
             js = stem + ".json" if self.json_auto.get() else numbered(self.json_path.get().strip(), index, count)
-            outputs.append((names, image, csv, js))
+            metrics = js if self.json.get() else os.path.join(TEMP_DIR, "msdf-atlas-gui_" + os.path.basename(stem) + ".json")
+            outputs.append((names, image, csv, js, metrics))
         self.outputs = outputs
 
         # Auto-named fields display the paths of atlas 1.
@@ -628,6 +730,10 @@ class App:
             self.csv_path.set(outputs[0][2])
         if self.json_auto.get():
             self.json_path.set(outputs[0][3])
+        # One Unreal Engine CSV for all the atlases, named after all the selected charsets.
+        if self.ue_csv_auto.get():
+            name = self.auto_base_name(self.selected_charsets(), True, "_UE")
+            self.ue_csv_path.set(os.path.join(os.path.dirname(outputs[0][1]), name + ".csv"))
 
     def update_states(self):
         def set_state(widget, enabled, readonly=False):
@@ -642,11 +748,13 @@ class App:
         set_state(self.dim_y_entry, not self.square.get())
         set_state(self.dim_y_label, not self.square.get())
         set_state(self.image_entry, True, readonly=self.image_auto.get())
-        for entry, enabled, auto in ((self.csv_entry, self.csv, self.csv_auto),
-                                     (self.json_entry, self.json, self.json_auto)):
-            set_state(entry, enabled.get(), readonly=auto.get())
+        for entry, enabled, auto in ((self.csv_entry, self.csv.get(), self.csv_auto),
+                                     (self.json_entry, self.json.get(), self.json_auto),
+                                     (self.ue_entry, self.ue_csv_active(), self.ue_csv_auto)):
+            set_state(entry, enabled, readonly=auto.get())
             for w in entry.side_widgets:
-                set_state(w, enabled.get())
+                set_state(w, enabled)
+        set_state(self.ue_entry.check, self.ue_csv_problem() is None)
 
         x = self.dim_x.get().strip()
         y = x if self.square.get() else self.dim_y.get().strip()
@@ -658,7 +766,7 @@ class App:
         cap_text = str(cap) if cap is not None else "n/a"
         if self.font_glyphs is None:
             source = " (codepoints, font not read)"
-        elif not self.font_exact:
+        elif self.font_bboxes is None:
             source = " (approx., CFF font)"
         else:
             source = ""
@@ -667,6 +775,8 @@ class App:
         text = "  ·  ".join(parts)
         if self.layout_errors:
             text += "\n" + "\n".join(self.layout_errors)
+        if self.ue_csv.get() and self.ue_csv_problem():
+            text += "\n" + self.ue_csv_problem()
         self.info.configure(text=text, foreground="#c00000" if self.layout_errors else "")
 
     def exe_for_command(self):
@@ -682,16 +792,18 @@ class App:
         dim_x = self.dim_x.get().strip()
         dim_y = dim_x if self.square.get() else self.dim_y.get().strip()
         tail += ["-dimensions", dim_x, dim_y]
+        ue = self.ue_csv_active()
         commands = []
-        for names, image, csv, js in self.outputs:
+        for names, image, csv, js, metrics in self.outputs:
             cmd = [self.exe_for_command(), "-font", self.font.get().strip()] + common
             if names:
                 cmd += ["-chars", ", ".join(SPECS[n] for n in names)]
             cmd += tail + ["-imageout", image]
             if self.csv.get():
                 cmd += ["-csv", csv]
-            if self.json.get():
-                cmd += ["-json", js]
+            # The Unreal Engine CSV is converted from the JSON metrics (temporary file if JSON is not ticked).
+            if self.json.get() or ue:
+                cmd += ["-json", metrics]
             commands.append(cmd)
         return commands
 
@@ -749,18 +861,21 @@ class App:
             positive(self.dim_y.get().strip(), "Dimension Y", True)
         errors += self.layout_errors
 
-        for _, image, csv, js in self.outputs:
-            outputs = [("Image output", image)]
+        outputs = []
+        for _, image, csv, js, _ in self.outputs:
+            outputs.append(("Image output", image))
             if self.csv.get():
                 outputs.append(("CSV", csv))
             if self.json.get():
                 outputs.append(("JSON", js))
-            for name, path in outputs:
-                folder = os.path.dirname(path)
-                if not os.path.basename(path):
-                    errors.append(f"{name}: empty path.")
-                elif not os.path.isdir(to_abs(folder or ".")):
-                    errors.append(f"{name}: folder does not exist ({folder}).")
+        if self.ue_csv_active():
+            outputs.append(("CSV UE", self.ue_csv_path.get().strip()))
+        for name, path in outputs:
+            folder = os.path.dirname(path)
+            if not os.path.basename(path):
+                errors.append(f"{name}: empty path.")
+            elif not os.path.isdir(to_abs(folder or ".")):
+                errors.append(f"{name}: folder does not exist ({folder}).")
         return list(dict.fromkeys(errors))
 
     # ----------------------------------------------------------- Execution
@@ -774,11 +889,28 @@ class App:
             return
         self.save()
         self.log_clear()
+        ue = None
+        if self.ue_csv_active():
+            metrics = [to_abs(o[4]) for o in self.outputs]
+            ue = (to_abs(self.ue_csv_path.get().strip()), metrics, self.font_bboxes,
+                  [] if self.json.get() else metrics)
+        elif self.ue_csv.get():
+            self.log_write(f"CSV UE skipped: {self.ue_csv_problem()}\n", "error")
         self.generate_btn.state(["disabled"])
         self.status.configure(text="Generating…")
-        threading.Thread(target=self.run, args=(self.build_commands(),), daemon=True).start()
+        threading.Thread(target=self.run, args=(self.build_commands(), ue), daemon=True).start()
 
-    def run(self, commands):
+    def run(self, commands, ue):
+        try:
+            self.run_commands(commands, ue)
+        finally:
+            for path in (ue[3] if ue else ()):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def run_commands(self, commands, ue):
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         # Relative paths are resolved by msdf-atlas-gen from BASE_DIR; the exe itself is passed absolute.
         executable = to_abs(self.exe.get().strip())
@@ -803,7 +935,22 @@ class App:
             if code != 0:
                 self.log_queue.put(("done", code))
                 return
-        self.log_queue.put(("done", 0))
+        code = 0
+        if ue is not None and not self.closing:
+            code = self.convert_ue(*ue[:3])
+        self.log_queue.put(("done", code))
+
+    def convert_ue(self, path, metrics, bboxes):
+        self.log_queue.put(("text", f"Writing CSV UE: {path}\n", "info"))
+        try:
+            count, warnings = write_ue_csv(path, metrics, bboxes)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.log_queue.put(("text", f"CSV UE failed: {type(e).__name__}: {e}\n", "error"))
+            return 1
+        for warning in warnings:
+            self.log_queue.put(("text", f"Warning: {warning}\n", None))
+        self.log_queue.put(("text", f"{count} glyphs written to the CSV UE.\n", "info"))
+        return 0
 
     def pump(self, stream, tag):
         for raw in iter(stream.readline, b""):
@@ -866,6 +1013,9 @@ class App:
             "json": self.json.get(),
             "json_auto": self.json_auto.get(),
             "json_path": self.json_path.get(),
+            "ue_csv": self.ue_csv.get(),
+            "ue_csv_auto": self.ue_csv_auto.get(),
+            "ue_csv_path": self.ue_csv_path.get(),
             "charset_order": self.order,
             "charset_atlas": self.charset_atlas,
             "atlas_mode": self.atlas_mode,
